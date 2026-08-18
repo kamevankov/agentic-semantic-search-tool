@@ -4,3 +4,6 @@ node_modules/
 python/__pycache__/
 test/python/__pycache__/
 .agentic-semantic-search/
+.coverage
+coverage.json
+htmlcov/

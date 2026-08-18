@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -73,6 +75,96 @@ class SymbolDetect(unittest.TestCase):
         self.assertIn(sym, {"Beta", "method"})
 
 
+class RegexFallback(unittest.TestCase):
+    def setUp(self):
+        self.saved_module = _sys.modules.get("_treesitter_chunks")
+        _sys.modules["_treesitter_chunks"] = None  # type: ignore[assignment]
+
+    def tearDown(self):
+        if self.saved_module is None:
+            _sys.modules.pop("_treesitter_chunks", None)
+        else:
+            _sys.modules["_treesitter_chunks"] = self.saved_module
+
+    def test_regex_fallback_covers_supported_syntaxes_and_windows(self):
+        cases = [
+            ("sample.py", ["def alpha():", "    return 1", "", "def beta():"], 2, "alpha"),
+            ("sample.js", ["export const alpha = () => {", "  return 1;", "};"], 2, "alpha"),
+            ("sample.go", ["func Alpha() int {", "  return 1", "}"], 2, "Alpha"),
+            ("sample.rs", ["pub struct Alpha {", "    value: i32", "}"], 2, "Alpha"),
+            ("Sample.java", ["public class Alpha {", "  int value;", "}"], 2, "Alpha"),
+            ("sample.cpp", ["int alpha() {", "  return 1;", "}"], 2, "alpha"),
+        ]
+        for filename, lines, line_number, expected in cases:
+            with self.subTest(filename=filename):
+                symbol, start, end = css.detect_symbol(Path(filename), line_number, lines)
+                self.assertEqual(symbol, expected)
+                self.assertLessEqual(start, line_number)
+                self.assertGreaterEqual(end, line_number)
+
+        self.assertEqual(
+            css.detect_symbol(Path("notes.txt"), 20, ["plain"] * 30),
+            (None, 10, 30),
+        )
+        self.assertEqual(
+            css.detect_symbol(Path("plain.py"), 2, ["value = 1", "value += 1"]),
+            (None, 1, 2),
+        )
+
+
+class TreeSitterInternals(unittest.TestCase):
+    def setUp(self):
+        import _treesitter_chunks as tsc  # type: ignore
+        self.tsc = tsc
+        self.saved_disabled = tsc._DISABLED
+        self.saved_failed = set(tsc._LOAD_FAILED)
+        self.saved_parsers = dict(tsc._PARSERS)
+        self.saved_cache = dict(tsc._TREE_CACHE)
+        self.saved_cache_max = tsc._TREE_CACHE_MAX
+
+    def tearDown(self):
+        self.tsc._DISABLED = self.saved_disabled
+        self.tsc._LOAD_FAILED.clear()
+        self.tsc._LOAD_FAILED.update(self.saved_failed)
+        self.tsc._PARSERS.clear()
+        self.tsc._PARSERS.update(self.saved_parsers)
+        self.tsc._TREE_CACHE.clear()
+        self.tsc._TREE_CACHE.update(self.saved_cache)
+        self.tsc._TREE_CACHE_MAX = self.saved_cache_max
+
+    def test_cache_and_unavailable_paths_are_bounded(self):
+        self.assertIsNone(self.tsc._tree_cache_key(Path("missing.py"), "python", 1))
+        self.assertIsNone(self.tsc._tree_cache_get(None))
+        self.tsc._tree_cache_put(None, object(), b"")
+        self.tsc._TREE_CACHE.clear()
+        self.tsc._TREE_CACHE_MAX = 1
+        self.tsc._tree_cache_put(("one",), "tree-one", b"one")
+        self.tsc._tree_cache_put(("two",), "tree-two", b"two")
+        self.assertNotIn(("one",), self.tsc._TREE_CACHE)
+        self.assertEqual(self.tsc._tree_cache_get(("two",)), ("tree-two", b"two"))
+        self.assertIsNone(self.tsc._get_parser("unsupported"))
+        self.tsc._DISABLED = True
+        self.assertIsNone(self.tsc._get_parser("python"))
+        self.assertFalse(self.tsc.is_available())
+
+    def test_unknown_extension_and_parse_failure_return_none(self):
+        self.assertIsNone(self.tsc.detect_symbol_treesitter(Path("notes.txt"), 1, ["plain"]))
+        original_get_parser = self.tsc._get_parser
+        class BrokenParser:
+            def parse(self, source):
+                raise RuntimeError("parse failed")
+        self.tsc._get_parser = lambda lang: BrokenParser()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / "broken.py"
+                source.write_text("def broken():\n    pass\n")
+                self.assertIsNone(self.tsc.detect_symbol_treesitter(
+                    source, 1, source.read_text().splitlines(),
+                ))
+        finally:
+            self.tsc._get_parser = original_get_parser
+
+
 class BM25(unittest.TestCase):
     def test_bm25_ordering(self):
         chunks = [
@@ -130,6 +222,16 @@ class CacheRoundTrip(unittest.TestCase):
         sym, _, _ = css.cached_chunk_for(f, 1, new_lines, [self.root])
         self.assertEqual(sym, "renamed")
 
+    def test_longest_matching_root_owns_the_cache_entry(self):
+        nested = self.root / "packages" / "nested"
+        nested.mkdir(parents=True)
+        source = nested / "owned.py"
+        source.write_text("def owned():\n    return True\n")
+        lines = source.read_text().splitlines()
+        css.cached_chunk_for(source, 1, lines, [self.root, nested])
+        self.assertTrue(css._index_path_for(nested).is_file())
+        self.assertFalse((self.root / ".agentic-semantic-search").exists())
+
 
 class CLISmoke(unittest.TestCase):
     def test_runs_and_returns_json(self):
@@ -146,6 +248,33 @@ class CLISmoke(unittest.TestCase):
             self.assertGreaterEqual(len(data), 1)
             self.assertEqual(data[0]["symbol"], "find_me")
             self.assertEqual(data[0]["lines"], [1, 2])
+
+    def test_no_cache_does_not_create_persistent_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "demo.py").write_text("def find_me():\n    return 7\n")
+            proc = subprocess.run(
+                [_sys.executable, str(SCRIPT), "--query", "find_me",
+                 "--root", str(root), "--no-cache"],
+                capture_output=True, text=True, check=False, timeout=15,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((root / ".agentic-semantic-search").exists())
+
+    def test_missing_ripgrep_preserves_exit_code_four(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "demo.py").write_text("def find_me():\n    return 7\n")
+            environment = dict(os.environ)
+            environment["PATH"] = ""
+            proc = subprocess.run(
+                [_sys.executable, str(SCRIPT), "--query", "find_me",
+                 "--root", str(root), "--no-cache"],
+                capture_output=True, text=True, check=False, timeout=15,
+                env=environment,
+            )
+            self.assertEqual(proc.returncode, 4)
+            self.assertIn("ripgrep", proc.stderr)
 
     def test_exact_symbol_recall_beats_generic_token_noise(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -605,6 +734,7 @@ class LocalEmbeddingBackend(unittest.TestCase):
         self.saved = {name: getattr(css, name) for name in self.CONFIG_NAMES}
         self.saved_llama = _sys.modules.get("llama_cpp")
         self.saved_download = css._download_model_file
+        css.EMBEDDING_MODEL_SHA256 = ""
         self._reset_backend()
 
     def tearDown(self):
@@ -637,6 +767,80 @@ class LocalEmbeddingBackend(unittest.TestCase):
             css.format_document_for_embedding(chunk),
             "title: answer | text: def answer():\n    return 42",
         )
+
+    def test_environment_parsers_and_vector_validation_edges(self):
+        original_float = os.environ.get("AGENTIC_TEST_FLOAT")
+        original_int = os.environ.get("AGENTIC_TEST_INT")
+        original_bool = os.environ.get("AGENTIC_TEST_BOOL")
+        try:
+            os.environ["AGENTIC_TEST_FLOAT"] = "invalid"
+            os.environ["AGENTIC_TEST_INT"] = "invalid"
+            os.environ["AGENTIC_TEST_BOOL"] = "off"
+            self.assertEqual(css._env_float("AGENTIC_TEST_FLOAT", 2.5, 1.0), 2.5)
+            self.assertEqual(css._env_int("AGENTIC_TEST_INT", 3, 0), 3)
+            self.assertFalse(css._env_enabled("AGENTIC_TEST_BOOL", True))
+            self.assertTrue(css._env_enabled("AGENTIC_TEST_MISSING", True))
+        finally:
+            for name, value in (
+                ("AGENTIC_TEST_FLOAT", original_float),
+                ("AGENTIC_TEST_INT", original_int),
+                ("AGENTIC_TEST_BOOL", original_bool),
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        class ArrayLike:
+            def tolist(self):
+                return [3, 4]
+        self.assertEqual(css._normalize_embedding(ArrayLike()), [0.6, 0.8])
+        for invalid in (None, [], "vector", [0, 0], ["bad"]):
+            self.assertIsNone(css._normalize_embedding(invalid))
+        self.assertEqual(css._extract_embedding_vectors([3, 4], 1), [[0.6, 0.8]])
+        self.assertIsNone(css._extract_embedding_vectors({"wrong": []}, 1))
+        self.assertIsNone(css._extract_embedding_vectors([[1, 0]], 2))
+        self.assertIsNone(css._extract_embedding_vectors([[1, 0], [1, 0, 0]], 2))
+        self.assertEqual(css._cosine([], []), 0.0)
+        self.assertEqual(css._cosine([0.0], [0.0]), 0.0)
+        self.assertEqual(css._cosine([1.0], [1.0, 2.0]), 0.0)
+
+    def test_model_file_validation_rejects_missing_empty_size_and_digest(self):
+        model = self.root / "model.gguf"
+        self.assertFalse(css._model_file_is_valid(model))
+        model.write_bytes(b"")
+        self.assertFalse(css._model_file_is_valid(model))
+        model.write_bytes(b"valid")
+        digest = css.hashlib.sha256(b"valid").hexdigest()
+        self.assertFalse(css._model_file_is_valid(model, expected_size=99))
+        self.assertFalse(css._model_file_is_valid(model, expected_sha256="0" * 64))
+        self.assertTrue(css._model_file_is_valid(
+            model, expected_size=5, expected_sha256=digest,
+        ))
+
+    def test_invalid_model_configuration_and_download_failure_are_safe(self):
+        css.EMBEDDING_MODEL_PATH = str(self.root / "missing.gguf")
+        self.assertIsNone(css._resolve_embedding_model_path())
+        self.assertTrue(css._LOCAL_EMBEDDER_DISABLED)
+
+        self._reset_backend()
+        css.EMBEDDING_MODEL_PATH = ""
+        css.EMBEDDING_MODEL_FILE = "../unsafe.gguf"
+        self.assertIsNone(css._resolve_embedding_model_path())
+        self.assertTrue(css._LOCAL_EMBEDDER_DISABLED)
+
+        self._reset_backend()
+        css.EMBEDDING_MODEL_FILE = "model.gguf"
+        css.EMBEDDING_MODEL_REPO = "example/custom"
+        css.EMBEDDING_MODEL_CACHE = str(self.root / "empty-cache")
+        css.EMBEDDING_MODEL_URL = "https://example.test/model.gguf"
+        css.EMBEDDING_AUTO_DOWNLOAD = True
+        css.EMBEDDING_OFFLINE = False
+        css._download_model_file = lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("network unavailable")
+        )
+        self.assertIsNone(css._resolve_embedding_model_path())
+        self.assertTrue(css._LOCAL_EMBEDDER_DISABLED)
 
     def test_download_is_atomic_and_rejects_incomplete_payload(self):
         class Response:
@@ -676,6 +880,75 @@ class LocalEmbeddingBackend(unittest.TestCase):
             self.assertFalse(bad_target.exists())
         finally:
             css._urlreq.urlopen = original_urlopen
+
+    def test_concurrent_downloads_publish_only_complete_files(self):
+        payload = b"concurrent-model-payload"
+        expected = css.hashlib.sha256(payload).hexdigest()
+        barrier = threading.Barrier(2)
+
+        class Response:
+            headers = {"Content-Length": str(len(payload))}
+            def __init__(self):
+                self.stream = io.BytesIO(payload)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, size):
+                return self.stream.read(size)
+
+        original_urlopen = css._urlreq.urlopen
+        errors = []
+        target = self.root / "models" / "shared.gguf"
+        def urlopen(*args, **kwargs):
+            barrier.wait(timeout=5)
+            return Response()
+        def download():
+            try:
+                css._download_model_file("https://example.test/model", target, expected)
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+        try:
+            css._urlreq.urlopen = urlopen
+            workers = [threading.Thread(target=download) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(list(target.parent.glob("*.part")), [])
+        finally:
+            css._urlreq.urlopen = original_urlopen
+
+    def test_corrupt_cached_model_is_rejected_and_replaced(self):
+        good = b"verified-model"
+        expected = css.hashlib.sha256(good).hexdigest()
+        css.EMBEDDING_MODEL_REPO = "example/custom"
+        css.EMBEDDING_MODEL_FILE = "custom.gguf"
+        css.EMBEDDING_MODEL_SHA256 = expected
+        css.EMBEDDING_MODEL_PATH = ""
+        css.EMBEDDING_MODEL_CACHE = str(self.root / "model-cache")
+        css.EMBEDDING_MODEL_URL = "https://example.test/custom.gguf"
+        target = Path(css.EMBEDDING_MODEL_CACHE) / css.EMBEDDING_MODEL_FILE
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"corrupt")
+
+        css.EMBEDDING_OFFLINE = True
+        self.assertIsNone(css._resolve_embedding_model_path())
+
+        self._reset_backend()
+        css.EMBEDDING_OFFLINE = False
+        calls = []
+        def replace(url, destination, checksum):
+            calls.append((url, destination, checksum))
+            destination.write_bytes(good)
+            return destination
+        css._download_model_file = replace
+        self.assertEqual(css._resolve_embedding_model_path(), target.resolve())
+        self.assertEqual(target.read_bytes(), good)
+        self.assertEqual(len(calls), 1)
 
     def test_offline_missing_model_never_downloads(self):
         css.EMBEDDING_MODEL_REPO = "example/custom"

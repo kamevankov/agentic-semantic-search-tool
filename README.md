@@ -170,8 +170,18 @@ Search, parsing, ranking, and inference are local. The only built-in network ope
 ## Development
 
 ```bash
+python3 -m pip install -r python/requirements-dev.txt
 npm test
+npm run test:coverage
 npm pack --dry-run
 ```
 
-The test suite covers the Node API and CLI, process cancellation and bounds, Python ranking modes, model resolution and atomic downloads, embedding normalization and caching, optional-backend fallbacks, and package-content scrubbing.
+Coverage gates require at least 90% Node lines/functions, 75% Node branches, and 75% combined Python line/branch coverage. The suite covers the Node API and CLI, process cancellation and bounds, Python ranking modes, model resolution and concurrent atomic downloads, corrupt-cache recovery, embedding normalization and caching, multi-root ownership, optional-backend fallbacks, and package-content scrubbing.
+
+Heavyweight integrations are opt-in so the ordinary test suite never downloads models. After installing both optional runtime requirement files, run:
+
+```bash
+AGENTIC_SEMANTIC_SEARCH_PYTHON=/path/to/python npm run test:integration
+```
+
+That suite performs a fresh, checksum-verified download of the full 333,590,944-byte GGUF from Hugging Face, verifies its pinned LFS metadata, loads it through `llama-cpp-python`, checks normalized 768-dimensional embeddings, and executes the configured sentence-transformers cross-encoder against relevant and irrelevant pairs.

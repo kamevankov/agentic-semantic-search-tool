@@ -836,6 +836,32 @@ def _report_local_embedding_error(message: str) -> None:
     sys.stderr.write(f"local embeddings unavailable: {message}; falling back\n")
 
 
+def _sha256_file(path: _Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as input_file:
+            for block in iter(lambda: input_file.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _model_file_is_valid(
+    path: _Path,
+    *,
+    expected_sha256: str = "",
+    expected_size: int = 0,
+) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0 or (expected_size > 0 and size != expected_size):
+        return False
+    return not expected_sha256 or _sha256_file(path) == expected_sha256.lower()
+
+
 def _download_model_file(
     url: str,
     target: _Path,
@@ -893,10 +919,15 @@ def _resolve_embedding_model_path() -> _Path | None:
         return _LOCAL_MODEL_PATH
     if EMBEDDING_MODEL_PATH.strip():
         configured = _Path(EMBEDDING_MODEL_PATH).expanduser().resolve()
-        if configured.is_file():
+        if _model_file_is_valid(
+            configured,
+            expected_sha256=EMBEDDING_MODEL_SHA256,
+        ):
             _LOCAL_MODEL_PATH = configured
             return configured
-        _report_local_embedding_error(f"configured model does not exist: {configured}")
+        _report_local_embedding_error(
+            f"configured model is missing, empty, or failed checksum validation: {configured}"
+        )
         _LOCAL_EMBEDDER_DISABLED = True
         return None
     if _Path(EMBEDDING_MODEL_FILE).name != EMBEDDING_MODEL_FILE:
@@ -913,10 +944,10 @@ def _resolve_embedding_model_path() -> _Path | None:
         )
         else 0
     )
-    if (
-        target.is_file()
-        and target.stat().st_size > 0
-        and (not expected_default_size or target.stat().st_size == expected_default_size)
+    if _model_file_is_valid(
+        target,
+        expected_sha256=EMBEDDING_MODEL_SHA256,
+        expected_size=expected_default_size,
     ):
         _LOCAL_MODEL_PATH = target
         return target
@@ -934,7 +965,11 @@ def _resolve_embedding_model_path() -> _Path | None:
             / "models"
             / "hf_ggml-org_embeddinggemma-300M-Q8_0.gguf"
         )
-        if shared.is_file() and shared.stat().st_size == DEFAULT_EMBEDDING_MODEL_SIZE:
+        if _model_file_is_valid(
+            shared,
+            expected_sha256=DEFAULT_EMBEDDING_MODEL_SHA256,
+            expected_size=DEFAULT_EMBEDDING_MODEL_SIZE,
+        ):
             _LOCAL_MODEL_PATH = shared.resolve()
             return _LOCAL_MODEL_PATH
 

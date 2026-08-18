@@ -21,3 +21,4 @@
 | Cancellation, timeout, and bounded output | Runtime controls |
 | Structured tool result and JSON Schema | SDK-neutral adapter surface |
 | Scoped read registration | Awaited `onHits` callback with normalized spans |
+| Enforced line/branch coverage and opt-in real-model tests | Development test commands |

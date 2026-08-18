@@ -117,11 +117,80 @@ test("AbortSignal terminates the Python engine", async () => {
   await assert.rejects(pending, (error) => error instanceof SemanticSearchError && error.code === "ABORTED");
 });
 
+test("an already-aborted signal prevents process launch", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const runtime = createSemanticSearchRuntime();
+  await assert.rejects(
+    runtime.search({ query: "needle" }, { signal: controller.signal }),
+    (error) => error instanceof SemanticSearchError && error.code === "ABORTED",
+  );
+});
+
+test("wall-clock timeout terminates a slow Python engine", async () => {
+  const scriptPath = path.resolve("test/fixtures/slow_engine.py");
+  const runtime = createSemanticSearchRuntime({ scriptPath, timeoutMs: 30 });
+  await assert.rejects(
+    runtime.search({ query: "needle" }),
+    (error) => error instanceof SemanticSearchError
+      && error.code === "TIMED_OUT"
+      && error.details.timeoutMs === 30,
+  );
+});
+
+for (const stream of ["stdout", "stderr"]) {
+  test(`${stream} byte limit terminates a noisy Python engine`, async () => {
+    const scriptPath = path.resolve(`test/fixtures/large_${stream}_engine.py`);
+    const options = stream === "stdout" ? { maxStdoutBytes: 128 } : { maxStderrBytes: 128 };
+    const runtime = createSemanticSearchRuntime({ scriptPath, ...options });
+    await assert.rejects(
+      runtime.search({ query: "needle" }),
+      (error) => error instanceof SemanticSearchError && error.code === "OUTPUT_LIMIT",
+    );
+  });
+}
+
+test("missing engine script fails before process launch", async () => {
+  const runtime = createSemanticSearchRuntime({ scriptPath: path.resolve("test/fixtures/absent.py") });
+  await assert.rejects(
+    runtime.search({ query: "needle" }),
+    (error) => error instanceof SemanticSearchError && error.code === "SCRIPT_NOT_FOUND",
+  );
+});
+
+test("missing Python executable has a stable spawn error", async () => {
+  const runtime = createSemanticSearchRuntime({ pythonBin: "python-that-does-not-exist-agentic-test" });
+  await assert.rejects(
+    runtime.search({ query: "needle" }),
+    (error) => error instanceof SemanticSearchError && error.code === "SPAWN_FAILED",
+  );
+});
+
+test("nonzero engine exit preserves diagnostics", async () => {
+  const runtime = createSemanticSearchRuntime({ scriptPath: path.resolve("test/fixtures/failing_engine.py") });
+  await assert.rejects(
+    runtime.search({ query: "needle" }),
+    (error) => error instanceof SemanticSearchError
+      && error.code === "PROCESS_FAILED"
+      && error.details.exitCode === 7
+      && String(error.details.stderrTail).includes("deliberate engine failure"),
+  );
+});
+
 test("invalid engine JSON fails with a stable error code", async () => {
   const scriptPath = path.resolve("test/fixtures/invalid_engine.py");
   const runtime = createSemanticSearchRuntime({ scriptPath });
   await assert.rejects(
     runtime.search({ query: "needle", noCache: true }),
+    (error) => error instanceof SemanticSearchError && error.code === "INVALID_OUTPUT",
+  );
+});
+
+test("malformed result objects fail contract validation", async () => {
+  const scriptPath = path.resolve("test/fixtures/malformed_hit_engine.py");
+  const runtime = createSemanticSearchRuntime({ scriptPath });
+  await assert.rejects(
+    runtime.search({ query: "needle" }),
     (error) => error instanceof SemanticSearchError && error.code === "INVALID_OUTPUT",
   );
 });
