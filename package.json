@@ -1,0 +1,40 @@
+{
+  "name": "agentic-semantic-search-tool",
+  "version": "0.1.0",
+  "description": "Harness-neutral hybrid lexical, structural, and semantic codebase search for agent runtimes",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "agentic-semantic-search": "./dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "python/_treesitter_chunks.py",
+    "python/agentic_semantic_search.py",
+    "python/requirements-semantic.txt",
+    "python/requirements-treesitter.txt",
+    "README.md",
+    "FEATURES.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test:node": "npm run build && node --test test/*.test.mjs",
+    "test:python": "python3 -m unittest discover -s test/python -p 'test_*.py' -v",
+    "test": "npm run test:node && npm run test:python",
+    "prepack": "npm test"
+  },
+  "engines": { "node": ">=22" },
+  "keywords": ["agent", "semantic-search", "code-search", "ripgrep", "tree-sitter", "bm25", "tool"],
+  "repository": { "type": "git", "url": "git+https://github.com/kamevankov/agentic-semantic-search-tool.git" },
+  "bugs": { "url": "https://github.com/kamevankov/agentic-semantic-search-tool/issues" },
+  "homepage": "https://github.com/kamevankov/agentic-semantic-search-tool#readme",
+  "license": "MIT",
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^6.0.0" }
+}

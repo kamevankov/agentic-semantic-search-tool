@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+*.log
+python/__pycache__/
+test/python/__pycache__/
+.agentic-semantic-search/
