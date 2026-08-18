@@ -1,8 +1,6 @@
 # agentic-semantic-search-tool
 
-A standalone, harness-neutral codebase search tool for Node agent runtimes. It combines ripgrep recall, BM25 ranking, structural symbol chunks, and optional semantic reranking while returning bounded, source-readable spans.
-
-This is the complete semantic-search stack extracted from myclaw/OpenClaw. It contains no OpenClaw plugin registration, session dependency, SDK dependency, or runtime cache from the source installation.
+A standalone, harness-neutral code search tool for Node agent runtimes. It combines ripgrep recall, BM25 ranking, structural symbol chunks, and fully local semantic reranking while returning bounded, source-readable spans.
 
 ## Install
 
@@ -16,19 +14,27 @@ Requirements:
 - Python 3.10 or newer
 - [`ripgrep`](https://github.com/BurntSushi/ripgrep) (`rg`) on `PATH`
 
-The core engine otherwise uses only Python's standard library. Optional structural grammars can be installed with:
+The default lexical and hybrid modes use only Python's standard library. Install optional tree-sitter grammars with:
 
 ```bash
 python3 -m pip install -r node_modules/agentic-semantic-search-tool/python/requirements-treesitter.txt
 ```
 
-Without them, the engine falls back to its bundled regex symbol detection. For local cross-encoder reranking:
+Install local EmbeddingGemma support for `semantic` mode with:
 
 ```bash
 python3 -m pip install -r node_modules/agentic-semantic-search-tool/python/requirements-semantic.txt
 ```
 
-## Minimal Node usage
+The first semantic search downloads `embeddinggemma-300M-Q8_0.gguf` from the [`ggml-org/embeddinggemma-300M-GGUF`](https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF) repository on Hugging Face. Inference runs locally through `llama-cpp-python`; no query or source text is sent to an embedding service.
+
+An optional cross-encoder can refine the embedding-ranked candidates:
+
+```bash
+python3 -m pip install -r node_modules/agentic-semantic-search-tool/python/requirements-cross-encoder.txt
+```
+
+## Node API
 
 ```js
 import { createSemanticSearchRuntime } from "agentic-semantic-search-tool";
@@ -37,7 +43,7 @@ const search = createSemanticSearchRuntime({ cwd: process.cwd() });
 const result = await search.search({
   query: "registerModeSystemTools",
   roots: ["src", "packages"],
-  mode: "hybrid",
+  mode: "semantic",
   limit: 10,
 });
 
@@ -60,7 +66,7 @@ Ranges are capped at 180 lines. Very large enclosing symbols are narrowed around
 
 ## Generic agent tool
 
-`createSemanticSearchTool` returns an SDK-independent function-tool object with a plain JSON Schema:
+`createSemanticSearchTool` returns an SDK-independent function-tool object with plain JSON Schema:
 
 ```js
 import { createSemanticSearchTool } from "agentic-semantic-search-tool";
@@ -74,32 +80,35 @@ registerWithYourHarness({
 });
 ```
 
-The compatible tool name is `codebase_semantic_search`. Its inputs are `query`, `roots`, `limit`, `mode`, `noCache`, and `rgTrace`.
+The tool name is `codebase_semantic_search`. Inputs are `query`, `roots`, `limit`, `mode`, `noCache`, and `rgTrace`.
 
 ## Search modes
 
 - `hybrid` (default): BM25 plus hit-density, symbol-name, path, and exact-identifier bonuses.
 - `lexical`: pure BM25 over matched chunks.
 - `symbols`: hybrid ranking, excluding hits that cannot be assigned to a symbol.
-- `semantic`: hybrid candidate generation, then a cross-encoder rerank over the top 50. If unavailable, it tries Ollama cosine similarity; if that is unavailable, it returns the weighted hybrid order. The `why` field identifies the actual path used.
+- `semantic`: hybrid candidate generation over the top 50, local EmbeddingGemma cosine ranking, then an optional cross-encoder. Missing optional components degrade cleanly to the remaining stages and finally to hybrid order. The `why` field records the path used.
 
-Recall runs exact, case-sensitive fixed-string searches for identifier-like terms before broad case-insensitive token recall. CamelCase and snake_case identifiers are split into component terms so queries can cross naming styles.
+Exact, case-sensitive fixed-string recall for identifier-like terms runs before broad case-insensitive token recall. CamelCase and snake_case identifiers are split into components so queries can cross naming styles.
+
+EmbeddingGemma receives QMD-compatible prefixes:
+
+```text
+task: search result | query: <query>
+title: <symbol-or-filename> | text: <source chunk>
+```
 
 ## Structural languages
 
-Tree-sitter support is loaded lazily for Python, JavaScript, JSX, TypeScript, TSX, Go, Rust, Java, C, and C headers. It detects functions, methods, nested definitions, classes, interfaces, type aliases, enums, function-bound variables, Rust impl blocks, and common C definitions. C++, headers without a grammar, and installations without optional grammars use the regex fallback.
+Tree-sitter support is loaded lazily for Python, JavaScript, JSX, TypeScript, TSX, Go, Rust, Java, C, and C headers. It detects functions, methods, nested definitions, classes, interfaces, type aliases, enums, function-bound variables, Rust impl blocks, and common C definitions. C++, headers without a grammar, and installations without optional grammars use the bundled regex fallback.
 
-Parsed syntax trees use a bounded 256-entry, process-local cache. Search roots skip common generated/vendor locations, lock files, minified JavaScript, and files over 1.5 MB.
+Parsed trees use a bounded 256-entry process-local cache. Searches skip common generated/vendor locations, lock files, minified JavaScript, and files over 1.5 MB.
 
 ## Read-state integration
 
-Search results often need to count as reads before an edit tool accepts changes. Use `onHits` to connect the packages without coupling them:
+Use `onHits` to connect search results to a file-tool runtime without coupling either package:
 
 ```js
-import { createSemanticSearchRuntime } from "agentic-semantic-search-tool";
-import { createFileToolsRuntime } from "agentic-file-tools";
-
-const files = createFileToolsRuntime({ root: process.cwd() });
 const search = createSemanticSearchRuntime({
   cwd: process.cwd(),
   onHits: (hits) => files.recordSearchHits(
@@ -108,7 +117,7 @@ const search = createSemanticSearchRuntime({
 });
 ```
 
-Callbacks are awaited before the search resolves, so the next tool call sees the registered spans. Callback errors emit `search.hit_callback_failed` and are non-fatal by default; set `strictHitCallbackErrors: true` to fail the search instead.
+Callbacks are awaited before search resolves. Callback errors emit `search.hit_callback_failed` and are non-fatal by default; set `strictHitCallbackErrors: true` to fail instead.
 
 ## CLI
 
@@ -121,41 +130,48 @@ npx agentic-semantic-search \
   --pretty
 ```
 
-Repeat `--root` for multiple repositories. `--rg-trace` writes the raw recall hits to stderr. Exit codes match the engine: `0` results, `2` no results, `3` invalid input or missing roots, and `4` missing ripgrep.
+Repeat `--root` for multiple repositories. `--rg-trace` writes raw recall hits to stderr. Exit codes are `0` for results, `2` for no results, `3` for invalid input or missing roots, and `4` when ripgrep is unavailable.
 
-## Configuration
+Model controls are also available through `--embedding-model`, `--model-cache`, `--offline`, `--no-model-download`, and `--gpu-layers`.
+
+## Runtime and model configuration
 
 Runtime options include:
 
 - `cwd`, `pythonBin`, and `scriptPath`
-- `timeoutMs` (default 60 seconds) and `AbortSignal` per invocation
-- `cacheDirectory` (relative to every root)
+- `timeoutMs` (60 seconds by default) and a per-invocation `AbortSignal`
+- `cacheDirectory` (relative to every search root)
+- `embeddingModelPath`, `modelCacheDirectory`, `offline`, `autoDownload`, and `gpuLayers`
 - bounded `maxStdoutBytes` and `maxStderrBytes`
 - `env`, `onEvent`, `onHits`, and `strictHitCallbackErrors`
 
 Environment variables:
 
 - `AGENTIC_SEMANTIC_SEARCH_PYTHON`: Python executable
-- `AGENTIC_SEMANTIC_SEARCH_CACHE_DIR`: cache path relative to each search root (default `.agentic-semantic-search`)
-- `AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL`: Ollama embedding model (default `nomic-embed-text`)
-- `AGENTIC_SEMANTIC_SEARCH_CROSS_ENCODER`: sentence-transformers model (default `cross-encoder/ms-marco-MiniLM-L-6-v2`)
-- `OLLAMA_URL`: Ollama endpoint (default `http://127.0.0.1:11434`)
+- `AGENTIC_SEMANTIC_SEARCH_CACHE_DIR`: per-root cache path (default `.agentic-semantic-search`)
+- `AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL_PATH`: existing local GGUF file
+- `AGENTIC_SEMANTIC_SEARCH_MODEL_CACHE`: model directory (default `~/.cache/agentic-semantic-search/models`)
+- `AGENTIC_SEMANTIC_SEARCH_AUTO_DOWNLOAD`: set to `0` to disable downloads
+- `AGENTIC_SEMANTIC_SEARCH_OFFLINE`: set to `1` to prohibit downloads
+- `AGENTIC_SEMANTIC_SEARCH_GPU_LAYERS`: llama.cpp GPU layer count (`-1` for all)
+- `AGENTIC_SEMANTIC_SEARCH_DOWNLOAD_TIMEOUT`: model-download timeout in seconds
+- `AGENTIC_SEMANTIC_SEARCH_EMBED_REPO`, `AGENTIC_SEMANTIC_SEARCH_EMBED_FILE`, and `AGENTIC_SEMANTIC_SEARCH_EMBED_URL`: advanced artifact overrides
+- `AGENTIC_SEMANTIC_SEARCH_EMBED_SHA256`: expected model digest; defaults to the pinned artifact's published LFS SHA-256
+- `AGENTIC_SEMANTIC_SEARCH_CROSS_ENCODER`: optional sentence-transformers model
 
-The legacy `CODEBASE_SEARCH_EMBED_MODEL` and `CODEBASE_SEARCH_CROSS_ENCODER` names remain accepted by the Python engine for migration compatibility.
+If the initial model download takes longer than the runtime's default timeout, set a larger `timeoutMs` for that invocation or download the GGUF separately and provide `embeddingModelPath`. Offline mode never performs a network request.
 
-## Cache behavior
+## Cache and privacy
 
-Each root gets `.agentic-semantic-search/index-v1.json` by default. Entries record the root's git commit and invalidate individual files using size, nanosecond mtime, and SHA-1 content fingerprints. Symbol spans and successful Ollama chunk embeddings are cached. Use `noCache: true` or `--no-cache` to bypass all persistent cache reads and writes.
+Each search root gets `.agentic-semantic-search/index-v2.json` by default. File entries invalidate on size, nanosecond mtime, and SHA-1 content fingerprint. Chunk embeddings are additionally keyed by model identity, so changing the GGUF cannot reuse incompatible vectors. Set `noCache: true` or `--no-cache` to bypass persistent reads and writes.
 
-## Privacy and execution boundary
+Search, parsing, ranking, and inference are local. The only built-in network operation is downloading a missing GGUF over HTTPS from its configured model URL. The Node runtime spawns Python without a shell, bounds stdout/stderr, enforces a wall-clock timeout, and terminates the process on abort or timeout.
 
-Lexical, BM25, symbol, and cache work is local. `semantic` mode may:
+## Development
 
-- send query/chunk text to the configured Ollama endpoint; and
-- load or download the configured sentence-transformers model through that Python library.
+```bash
+npm test
+npm pack --dry-run
+```
 
-Do not point `OLLAMA_URL` at a remote service unless sending source excerpts there is acceptable. The Node runtime uses argument-vector process spawning with no shell, enforces wall-clock and output limits, and terminates the engine on abort or timeout.
-
-## What is intentionally excluded
-
-The package excludes the OpenClaw extension manifest, plugin API adapter, per-session wiring, configuration schema, and existing `.openclaw` cache data. Their reusable behaviors are represented by the generic tool schema, structured details, events, and hit callback.
+The test suite covers the Node API and CLI, process cancellation and bounds, Python ranking modes, model resolution and atomic downloads, embedding normalization and caching, optional-backend fallbacks, and package-content scrubbing.

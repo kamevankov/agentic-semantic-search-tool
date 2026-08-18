@@ -1,12 +1,14 @@
 """Smoke + unit tests for the bundled agentic semantic search engine.
 
-Run: python3 -m unittest test_codebase_semantic_search.py -v
+Run: python3 -m unittest discover -s test/python -p 'test_*.py' -v
 """
 from __future__ import annotations
 import importlib.util
+import io
 import json
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -353,14 +355,15 @@ class CrossEncoderRerank(unittest.TestCase):
         self._saved_disabled = css._CROSS_ENCODER_DISABLED
         self._saved_cache = dict(css._CROSS_ENCODER_CACHE)
         self._saved_loader = css._load_cross_encoder
-        self._saved_embed = css._ollama_embed
+        self._saved_embed = css._local_embed_many
+        css._local_embed_many = lambda *a, **k: None
 
     def tearDown(self):
         css._CROSS_ENCODER_DISABLED = self._saved_disabled
         css._CROSS_ENCODER_CACHE.clear()
         css._CROSS_ENCODER_CACHE.update(self._saved_cache)
         css._load_cross_encoder = self._saved_loader
-        css._ollama_embed = self._saved_embed
+        css._local_embed_many = self._saved_embed
         self.tmp.cleanup()
 
     def test_ce_available_path_emits_ce_rerank(self):
@@ -381,10 +384,10 @@ class CrossEncoderRerank(unittest.TestCase):
         self.assertNotIn("ce_rerank=unavailable", joined)
 
     def test_ce_unavailable_falls_back_with_explanation(self):
-        # Force CE off and Ollama offline so we hit the weighted-hybrid fallback.
+        # Force both optional stages off so we hit the weighted-hybrid fallback.
         css._CROSS_ENCODER_DISABLED = True
         css._load_cross_encoder = lambda: None
-        css._ollama_embed = lambda *a, **k: None
+        css._local_embed_many = lambda *a, **k: None
         results = css.search(
             query="needle", roots=[self.root], limit=5,
             mode="semantic", rg_trace=False, use_cache=False,
@@ -488,14 +491,15 @@ class SemanticRerankShape(unittest.TestCase):
         self._saved_disabled = css._CROSS_ENCODER_DISABLED
         self._saved_cache = dict(css._CROSS_ENCODER_CACHE)
         self._saved_loader = css._load_cross_encoder
-        self._saved_embed = css._ollama_embed
+        self._saved_embed = css._local_embed_many
+        css._local_embed_many = lambda *a, **k: None
 
     def tearDown(self):
         css._CROSS_ENCODER_DISABLED = self._saved_disabled
         css._CROSS_ENCODER_CACHE.clear()
         css._CROSS_ENCODER_CACHE.update(self._saved_cache)
         css._load_cross_encoder = self._saved_loader
-        css._ollama_embed = self._saved_embed
+        css._local_embed_many = self._saved_embed
         self.tmp.cleanup()
 
     def _shape_ok(self, results):
@@ -529,7 +533,7 @@ class SemanticRerankShape(unittest.TestCase):
     def test_shape_preserved_on_full_fallback(self):
         css._CROSS_ENCODER_DISABLED = True
         css._load_cross_encoder = lambda: None
-        css._ollama_embed = lambda *a, **k: None
+        css._local_embed_many = lambda *a, **k: None
         results = css.search(
             query="needle", roots=[self.root], limit=5,
             mode="semantic", rg_trace=False, use_cache=False,
@@ -548,26 +552,26 @@ class SemanticRerankShape(unittest.TestCase):
                 raise RuntimeError("predict exploded")
         css._CROSS_ENCODER_DISABLED = False
         css._load_cross_encoder = lambda: BoomCE()
-        # Ollama returns a deterministic vector so the cosine path produces a number.
-        css._ollama_embed = lambda *a, **k: [0.1, 0.2, 0.3, 0.4]
+        # The local backend returns deterministic vectors for query and documents.
+        css._local_embed_many = lambda texts: [[1.0, 0.0] for _ in texts]
         results = css.search(
             query="needle", roots=[self.root], limit=5,
             mode="semantic", rg_trace=False, use_cache=False,
         )
         self._shape_ok(results)
         why = " | ".join(r.why for r in results)
-        # CE was attempted but predict raised, so we land on the Ollama cosine branch.
+        # CE was attempted but predict raised, so local cosine ranking is retained.
         self.assertIn("ce_rerank=unavailable", why)
-        self.assertIn("Ollama nomic-embed-text cosine rerank", why)
+        self.assertIn("local EmbeddingGemma cosine rerank", why)
         # Per-result cosine signal recorded as semantic=<float>, not "unavailable".
         self.assertNotIn("semantic=unavailable", why)
 
     def test_shape_preserved_on_cosine_fallback_when_ce_none(self):
-        """CE unavailable + Ollama online must use the weighted cosine path
+        """CE unavailable + local embeddings must use the weighted cosine path
         and emit a numeric semantic= score per result."""
         css._CROSS_ENCODER_DISABLED = True
         css._load_cross_encoder = lambda: None
-        css._ollama_embed = lambda *a, **k: [0.5, 0.5, 0.5, 0.5]
+        css._local_embed_many = lambda texts: [[0.5, 0.5] for _ in texts]
         results = css.search(
             query="needle", roots=[self.root], limit=5,
             mode="semantic", rg_trace=False, use_cache=False,
@@ -575,5 +579,199 @@ class SemanticRerankShape(unittest.TestCase):
         self._shape_ok(results)
         why = " | ".join(r.why for r in results)
         self.assertIn("ce_rerank=unavailable", why)
-        self.assertIn("Ollama nomic-embed-text cosine rerank", why)
+        self.assertIn("local EmbeddingGemma cosine rerank", why)
         self.assertNotIn("semantic=unavailable", why)
+
+
+class LocalEmbeddingBackend(unittest.TestCase):
+    """Exercise model resolution, safe downloads, loader compatibility, and cache keys."""
+
+    CONFIG_NAMES = (
+        "EMBEDDING_MODEL_REPO",
+        "EMBEDDING_MODEL_FILE",
+        "EMBEDDING_MODEL_URL",
+        "EMBEDDING_MODEL_SHA256",
+        "EMBEDDING_MODEL_PATH",
+        "EMBEDDING_MODEL_CACHE",
+        "EMBEDDING_AUTO_DOWNLOAD",
+        "EMBEDDING_OFFLINE",
+        "EMBEDDING_DOWNLOAD_TIMEOUT",
+        "EMBEDDING_GPU_LAYERS",
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.saved = {name: getattr(css, name) for name in self.CONFIG_NAMES}
+        self.saved_llama = _sys.modules.get("llama_cpp")
+        self.saved_download = css._download_model_file
+        self._reset_backend()
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(css, name, value)
+        css._download_model_file = self.saved_download
+        if self.saved_llama is None:
+            _sys.modules.pop("llama_cpp", None)
+        else:
+            _sys.modules["llama_cpp"] = self.saved_llama
+        self._reset_backend()
+        self.tmp.cleanup()
+
+    def _reset_backend(self):
+        css._LOCAL_EMBEDDER = None
+        css._LOCAL_EMBEDDER_DISABLED = False
+        css._LOCAL_EMBEDDER_ERROR = None
+        css._LOCAL_MODEL_PATH = None
+
+    def test_qmd_compatible_prompt_format(self):
+        chunk = css.Chunk(
+            file="src/example.py", start=1, end=2, symbol="answer",
+            text="def answer():\n    return 42", hit_lines=[1],
+        )
+        self.assertEqual(
+            css.format_query_for_embedding("find the answer"),
+            "task: search result | query: find the answer",
+        )
+        self.assertEqual(
+            css.format_document_for_embedding(chunk),
+            "title: answer | text: def answer():\n    return 42",
+        )
+
+    def test_download_is_atomic_and_rejects_incomplete_payload(self):
+        class Response:
+            def __init__(self, payload, declared):
+                self.stream = io.BytesIO(payload)
+                self.headers = {"Content-Length": str(declared)}
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, size):
+                return self.stream.read(size)
+
+        original_urlopen = css._urlreq.urlopen
+        try:
+            css._urlreq.urlopen = lambda *a, **k: Response(b"model-data", 10)
+            target = self.root / "models" / "model.gguf"
+            self.assertEqual(css._download_model_file("https://example.test/model", target), target)
+            self.assertEqual(target.read_bytes(), b"model-data")
+            self.assertEqual(list(target.parent.glob("*.part")), [])
+
+            css._urlreq.urlopen = lambda *a, **k: Response(b"short", 50)
+            bad_target = self.root / "models" / "bad.gguf"
+            with self.assertRaises(OSError):
+                css._download_model_file("https://example.test/bad", bad_target)
+            self.assertFalse(bad_target.exists())
+            self.assertEqual(list(bad_target.parent.glob("*.part")), [])
+            with self.assertRaises(ValueError):
+                css._download_model_file("http://example.test/model", bad_target)
+            css._urlreq.urlopen = lambda *a, **k: Response(b"model-data", 10)
+            with self.assertRaises(OSError):
+                css._download_model_file(
+                    "https://example.test/model",
+                    bad_target,
+                    "0" * 64,
+                )
+            self.assertFalse(bad_target.exists())
+        finally:
+            css._urlreq.urlopen = original_urlopen
+
+    def test_offline_missing_model_never_downloads(self):
+        css.EMBEDDING_MODEL_REPO = "example/custom"
+        css.EMBEDDING_MODEL_FILE = "missing.gguf"
+        css.EMBEDDING_MODEL_PATH = ""
+        css.EMBEDDING_MODEL_CACHE = str(self.root / "empty-cache")
+        css.EMBEDDING_OFFLINE = True
+        called = {"count": 0}
+        def fail_download(*args, **kwargs):
+            called["count"] += 1
+            raise AssertionError("offline resolution attempted a download")
+        css._download_model_file = fail_download
+        self.assertIsNone(css._resolve_embedding_model_path())
+        self.assertEqual(called["count"], 0)
+
+    def test_missing_llama_dependency_does_not_download_model(self):
+        _sys.modules["llama_cpp"] = None  # type: ignore[assignment]
+        css.EMBEDDING_MODEL_PATH = ""
+        css.EMBEDDING_MODEL_CACHE = str(self.root / "empty-cache")
+        called = {"count": 0}
+        def count_download(*args, **kwargs):
+            called["count"] += 1
+            return self.root / "never.gguf"
+        css._download_model_file = count_download
+        self.assertIsNone(css._load_local_embedder())
+        self.assertEqual(called["count"], 0)
+
+    def test_loader_supports_embedding_flag_and_normalizes_vectors(self):
+        model_path = self.root / "model.gguf"
+        model_path.write_bytes(b"gguf")
+        css.EMBEDDING_MODEL_PATH = str(model_path)
+        instances = []
+        fake = types.ModuleType("llama_cpp")
+
+        class FakeLlama:
+            def __init__(self, model_path, embedding=False, **kwargs):
+                self.model_path = model_path
+                self.embedding = embedding
+                instances.append(self)
+            def embed(self, texts, normalize=True, truncate=True):
+                self.call = (list(texts), normalize, truncate)
+                return [[3.0, 4.0] for _ in texts]
+
+        fake.Llama = FakeLlama  # type: ignore[attr-defined]
+        _sys.modules["llama_cpp"] = fake
+        vectors = css._local_embed_many(["one", "two"])
+        self.assertEqual(vectors, [[0.6, 0.8], [0.6, 0.8]])
+        self.assertTrue(instances[0].embedding)
+        self.assertEqual(instances[0].call, (["one", "two"], True, True))
+
+    def test_loader_supports_plural_flag_and_openai_response(self):
+        model_path = self.root / "model.gguf"
+        model_path.write_bytes(b"gguf")
+        css.EMBEDDING_MODEL_PATH = str(model_path)
+        instances = []
+        fake = types.ModuleType("llama_cpp")
+
+        class FakeLlama:
+            def __init__(self, model_path, embeddings=False, **kwargs):
+                self.embeddings = embeddings
+                instances.append(self)
+            def create_embedding(self, texts):
+                return {"data": [
+                    {"index": index, "embedding": [0.0, float(index + 1)]}
+                    for index, _ in enumerate(texts)
+                ]}
+
+        fake.Llama = FakeLlama  # type: ignore[attr-defined]
+        _sys.modules["llama_cpp"] = fake
+        vectors = css._local_embed_many(["one", "two"])
+        self.assertEqual(vectors, [[0.0, 1.0], [0.0, 1.0]])
+        self.assertTrue(instances[0].embeddings)
+
+    def test_chunk_embeddings_are_batched_cached_and_model_aware(self):
+        source = self.root / "source.py"
+        source.write_text("def answer():\n    return 42\n")
+        model_path = self.root / "model.gguf"
+        model_path.write_bytes(b"model-a")
+        css._LOCAL_MODEL_PATH = model_path
+        chunk = css.Chunk(
+            file=str(source), start=1, end=2, symbol="answer",
+            text=source.read_text(), hit_lines=[1],
+        )
+        original_embed = css._local_embed_many
+        calls = []
+        css._local_embed_many = lambda texts: calls.append(list(texts)) or [[1.0, 0.0] for _ in texts]
+        try:
+            first = css._embeddings_for_chunks([chunk], [self.root], use_cache=True)
+            second = css._embeddings_for_chunks([chunk], [self.root], use_cache=True)
+            self.assertEqual(first, second)
+            self.assertEqual(len(calls), 1)
+            identity_a = css._embedding_model_identity()
+            model_path.write_bytes(b"model-b-with-different-size")
+            identity_b = css._embedding_model_identity()
+            self.assertNotEqual(identity_a, identity_b)
+            css._embeddings_for_chunks([chunk], [self.root], use_cache=True)
+            self.assertEqual(len(calls), 2)
+        finally:
+            css._local_embed_many = original_embed

@@ -70,6 +70,9 @@ function errorCode(error: unknown): SemanticSearchError["code"] {
 
 export function createSemanticSearchRuntime(options: SemanticSearchRuntimeOptions = {}): SemanticSearchRuntime {
   const cwd = path.resolve(options.cwd ?? process.cwd());
+  if (options.gpuLayers !== undefined && (!Number.isInteger(options.gpuLayers) || options.gpuLayers < -1)) {
+    throw new SemanticSearchError("INVALID_INPUT", "gpuLayers must be an integer of -1 or greater");
+  }
   const now = options.now ?? Date.now;
   const emit = (event: SemanticSearchEvent, context?: SemanticSearchExecutionContext) => {
     try { options.onEvent?.(event); } catch { /* telemetry is isolated */ }
@@ -120,6 +123,11 @@ export function createSemanticSearchRuntime(options: SemanticSearchRuntimeOption
         timeoutMs: options.timeoutMs,
         env: options.env,
         cacheDirectory: options.cacheDirectory,
+        embeddingModelPath: options.embeddingModelPath,
+        modelCacheDirectory: options.modelCacheDirectory,
+        offline: options.offline,
+        autoDownload: options.autoDownload,
+        gpuLayers: options.gpuLayers,
         maxStdoutBytes: options.maxStdoutBytes,
         maxStderrBytes: options.maxStderrBytes,
         signal: context.signal,

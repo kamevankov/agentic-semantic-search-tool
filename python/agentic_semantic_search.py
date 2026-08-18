@@ -10,12 +10,12 @@ Capabilities (shipped):
 - Persistent incremental index per repo root. It records the git commit and
   invalidates each file by path + size + mtime-ns + sha1 under
   `<repo-root>/.agentic-semantic-search/` by default.
-- Embedding via Ollama `nomic-embed-text` for `--mode semantic` and the
-  optional cosine rerank in `hybrid`; degrades cleanly to weighted hybrid
-  when Ollama is unreachable (`why` records `semantic=unavailable`).
-- Optional cross-encoder rerank over the top candidates in `--mode semantic`;
-  falls back to embedding cosine when CE is unavailable (`why` records
-  `ce_rerank=unavailable`).
+- Local EmbeddingGemma GGUF cosine reranking for `--mode semantic`, using the
+  same query/document formatting as QMD. The model is resolved lazily from a
+  local path, a shared QMD cache, or Hugging Face.
+- Optional cross-encoder reranking after embedding similarity. When either
+  optional backend is unavailable, the engine degrades cleanly through the
+  remaining stage to weighted hybrid ranking.
 - Output: JSON list of {file, lines, symbol, score, why}.
 - Emits ripgrep-style `path:line:content` lines on stderr (--rg-trace) so
   harnesses can register returned spans as scoped reads. The bundled Node
@@ -219,7 +219,6 @@ DEFAULT_GLOB_EXCLUDES = [
     "!**/.git/**",
     "!**/dist/**",
     "!**/build/**",
-    "!**/.openclaw/**",
     "!**/.agentic-semantic-search/**",
     "!**/__pycache__/**",
     "!**/*.min.js",
@@ -516,47 +515,66 @@ def search(
     scored.sort(key=lambda x: x[1], reverse=True)
     if mode == "semantic":
         top = scored[:50]
-        # Stage 1: cross-encoder rerank (preferred when sentence-transformers is available).
-        ce_scores = _cross_encoder_rerank(query, [c for c, _, _ in top])
+        # Stage 1: local EmbeddingGemma cosine rerank. This is deliberately
+        # attempted before the optional cross-encoder so the configured local
+        # embedding backend is the semantic foundation rather than a fallback.
+        qvecs = _local_embed_many([format_query_for_embedding(query)])
+        qvec = qvecs[0] if qvecs else None
+        embedding_ranked: list[tuple[Chunk, float, str, float | None]] = []
+        if qvec is not None:
+            doc_vecs = _embeddings_for_chunks(
+                [c for c, _, _ in top],
+                roots,
+                use_cache=use_cache,
+            )
+            max_hybrid = max(top[0][1], 1e-6)
+            for (c, s, why), vec in zip(top, doc_vecs):
+                sim = _cosine(qvec, vec) if vec else 0.0
+                combined = 0.35 * sim + 0.65 * (s / max_hybrid)
+                embedding_ranked.append((c, combined, why, sim))
+            embedding_ranked.sort(key=lambda x: x[1], reverse=True)
+        else:
+            embedding_ranked = [(c, s, why, None) for c, s, why in top]
+
+        # Stage 2: optional cross-encoder over the embedding-ranked candidates.
+        ce_scores = _cross_encoder_rerank(query, [c for c, _, _, _ in embedding_ranked])
         if ce_scores is not None:
-            reranked_ce: list[tuple[Chunk, float, str, float]] = []
-            for (c, s, why), ce in zip(top, ce_scores):
-                reranked_ce.append((c, float(ce), why, float(ce)))
+            reranked_ce: list[tuple[Chunk, float, str, float | None, float]] = []
+            for (c, _s, why, sim), ce in zip(embedding_ranked, ce_scores):
+                reranked_ce.append((c, float(ce), why, sim, float(ce)))
             reranked_ce.sort(key=lambda x: x[1], reverse=True)
             results: list[Result] = []
-            for c, combined, why, ce in reranked_ce[:limit]:
+            for c, combined, why, sim, ce in reranked_ce[:limit]:
+                embedding_note = (
+                    f"embeddinggemma={sim:.3f}"
+                    if sim is not None
+                    else "embeddinggemma=unavailable"
+                )
                 results.append(result_from_chunk(
                     c,
                     combined,
-                    f"{why}, ce_rerank={ce:.3f}; mode=semantic (BM25+hybrid then cross-encoder {CROSS_ENCODER_MODEL} rerank)",
+                    f"{why}, {embedding_note}, ce_rerank={ce:.3f}; "
+                    f"mode=semantic (hybrid + local EmbeddingGemma + cross-encoder {CROSS_ENCODER_MODEL})",
                 ))
             return results
-        # Stage 2 fallback: Ollama nomic-embed-text cosine rerank.
-        qvec = _ollama_embed(query)
+
         if qvec is None:
             results = []
-            for c, s, why in top[:limit]:
+            for c, s, why, _sim in embedding_ranked[:limit]:
                 results.append(result_from_chunk(
                     c,
                     s,
-                    why + ", ce_rerank=unavailable, semantic=unavailable; mode=semantic (cross-encoder + Ollama offline; weighted hybrid fallback)",
+                    why + ", embeddinggemma=unavailable, ce_rerank=unavailable, "
+                    "semantic=unavailable; mode=semantic (weighted hybrid fallback)",
                 ))
             return results
-        reranked: list[tuple[Chunk, float, str, float]] = []
-        for c, s, why in top:
-            vec = _embed_for_chunk(c, roots) if use_cache else _ollama_embed(c.text[:8000])
-            sim = _cosine(qvec, vec) if vec else 0.0
-            # Keep exact-symbol/lexical signal strong in the fallback path.
-            # Embedding-only rerank is too fuzzy for code identifiers.
-            combined = 0.35 * sim + 0.65 * (s / (max(scored[0][1], 1e-6)))
-            reranked.append((c, combined, why, sim))
-        reranked.sort(key=lambda x: x[1], reverse=True)
         results = []
-        for c, combined, why, sim in reranked[:limit]:
+        for c, combined, why, sim in embedding_ranked[:limit]:
             results.append(result_from_chunk(
                 c,
                 combined,
-                f"{why}, ce_rerank=unavailable, semantic={sim:.2f}; mode=semantic (BM25+hybrid then Ollama nomic-embed-text cosine rerank; cross-encoder unavailable)",
+                f"{why}, embeddinggemma={sim:.3f}, ce_rerank=unavailable, "
+                "semantic=local; mode=semantic (hybrid + local EmbeddingGemma cosine rerank)",
             ))
         return results
     results = []
@@ -596,15 +614,14 @@ def main() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Persistent incremental index + optional Ollama semantic rerank.
-# Appended in v2 (task #161). Keep additive; don't break the v1 surface.
+# Persistent incremental index + optional local semantic reranking.
 # --------------------------------------------------------------------------- #
 import hashlib
+import inspect as _inspect
 import json as _json
 import os as _os
 import time as _time
 import urllib.request as _urlreq
-import urllib.error as _urlerr
 import subprocess as _subp
 from pathlib import Path as _Path
 
@@ -612,7 +629,7 @@ CACHE_DIRNAME = _os.environ.get(
     "AGENTIC_SEMANTIC_SEARCH_CACHE_DIR",
     ".agentic-semantic-search",
 )
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _git_commit_for(root: _Path) -> str:
@@ -726,31 +743,320 @@ def cached_chunk_for(
     return (symbol, start, end)
 
 
-# ---- Ollama embedding (semantic mode) ------------------------------------- #
+# ---- Local EmbeddingGemma backend (semantic mode) ------------------------ #
 
-OLLAMA_URL = _os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_EMBED_MODEL = _os.environ.get(
-    "AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL",
-    _os.environ.get("CODEBASE_SEARCH_EMBED_MODEL", "nomic-embed-text"),
+DEFAULT_EMBEDDING_MODEL_REPO = "ggml-org/embeddinggemma-300M-GGUF"
+DEFAULT_EMBEDDING_MODEL_FILE = "embeddinggemma-300M-Q8_0.gguf"
+DEFAULT_EMBEDDING_MODEL_SHA256 = "b5ce9d77a3fc4b3b39ccb5643c36777911cc4eb46a66962eadfa3f5f60490d63"
+DEFAULT_EMBEDDING_MODEL_SIZE = 333_590_944
+EMBEDDING_MODEL_REPO = _os.environ.get(
+    "AGENTIC_SEMANTIC_SEARCH_EMBED_REPO",
+    DEFAULT_EMBEDDING_MODEL_REPO,
+)
+EMBEDDING_MODEL_FILE = _os.environ.get(
+    "AGENTIC_SEMANTIC_SEARCH_EMBED_FILE",
+    DEFAULT_EMBEDDING_MODEL_FILE,
+)
+EMBEDDING_MODEL_URL = _os.environ.get(
+    "AGENTIC_SEMANTIC_SEARCH_EMBED_URL",
+    f"https://huggingface.co/{EMBEDDING_MODEL_REPO}/resolve/main/{EMBEDDING_MODEL_FILE}",
+)
+EMBEDDING_MODEL_SHA256 = _os.environ.get(
+    "AGENTIC_SEMANTIC_SEARCH_EMBED_SHA256",
+    DEFAULT_EMBEDDING_MODEL_SHA256
+    if (
+        EMBEDDING_MODEL_REPO == DEFAULT_EMBEDDING_MODEL_REPO
+        and EMBEDDING_MODEL_FILE == DEFAULT_EMBEDDING_MODEL_FILE
+    )
+    else "",
+).strip().lower()
+EMBEDDING_MODEL_PATH = _os.environ.get("AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL_PATH", "")
+EMBEDDING_MODEL_CACHE = _os.environ.get(
+    "AGENTIC_SEMANTIC_SEARCH_MODEL_CACHE",
+    str(_Path.home() / ".cache" / "agentic-semantic-search" / "models"),
 )
 
 
-def _ollama_embed(text: str, timeout: float = 6.0) -> list[float] | None:
-    body = _json.dumps({"model": OLLAMA_EMBED_MODEL, "prompt": text}).encode("utf-8")
-    req = _urlreq.Request(
-        f"{OLLAMA_URL}/api/embeddings",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
+def _env_float(name: str, default: float, minimum: float) -> float:
     try:
-        with _urlreq.urlopen(req, timeout=timeout) as resp:
-            payload = _json.loads(resp.read().decode("utf-8"))
-        emb = payload.get("embedding")
-        if isinstance(emb, list) and emb:
-            return [float(x) for x in emb]
-    except (_urlerr.URLError, _urlerr.HTTPError, OSError, ValueError):
+        return max(minimum, float(_os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(_os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+EMBEDDING_DOWNLOAD_TIMEOUT = _env_float(
+    "AGENTIC_SEMANTIC_SEARCH_DOWNLOAD_TIMEOUT", 300.0, 1.0
+)
+EMBEDDING_GPU_LAYERS = _env_int(
+    "AGENTIC_SEMANTIC_SEARCH_GPU_LAYERS", 0, -1
+)
+
+
+def _env_enabled(name: str, default: bool) -> bool:
+    value = _os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+EMBEDDING_AUTO_DOWNLOAD = _env_enabled(
+    "AGENTIC_SEMANTIC_SEARCH_AUTO_DOWNLOAD",
+    True,
+)
+EMBEDDING_OFFLINE = _env_enabled("AGENTIC_SEMANTIC_SEARCH_OFFLINE", False)
+
+_LOCAL_EMBEDDER: object | None = None
+_LOCAL_EMBEDDER_DISABLED = False
+_LOCAL_EMBEDDER_ERROR: str | None = None
+_LOCAL_MODEL_PATH: _Path | None = None
+
+
+def format_query_for_embedding(query: str) -> str:
+    """Use the task prefix expected by the QMD EmbeddingGemma pipeline."""
+    return f"task: search result | query: {query}"
+
+
+def format_document_for_embedding(chunk: "Chunk") -> str:
+    title = chunk.symbol or _Path(chunk.file).name or "none"
+    return f"title: {title} | text: {chunk.text[:8000]}"
+
+
+def _report_local_embedding_error(message: str) -> None:
+    global _LOCAL_EMBEDDER_ERROR
+    if _LOCAL_EMBEDDER_ERROR == message:
+        return
+    _LOCAL_EMBEDDER_ERROR = message
+    sys.stderr.write(f"local embeddings unavailable: {message}; falling back\n")
+
+
+def _download_model_file(
+    url: str,
+    target: _Path,
+    expected_sha256: str = "",
+) -> _Path:
+    """Download to a unique partial file and atomically publish on success."""
+    if not url.startswith("https://"):
+        raise ValueError("embedding model URL must use https")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(
+        f".{target.name}.{_os.getpid()}.{_time.time_ns()}.part"
+    )
+    request = _urlreq.Request(
+        url,
+        headers={"User-Agent": "agentic-semantic-search-tool/0.1"},
+    )
+    written = 0
+    expected = 0
+    digest = hashlib.sha256()
+    try:
+        with _urlreq.urlopen(request, timeout=EMBEDDING_DOWNLOAD_TIMEOUT) as response:
+            header_value = response.headers.get("Content-Length")
+            expected = int(header_value) if header_value else 0
+            with partial.open("xb") as output:
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    output.write(block)
+                    digest.update(block)
+                    written += len(block)
+                output.flush()
+                _os.fsync(output.fileno())
+        if written <= 0:
+            raise OSError("embedding model download was empty")
+        if expected > 0 and written != expected:
+            raise OSError(
+                f"embedding model download was incomplete ({written}/{expected} bytes)"
+            )
+        if expected_sha256 and digest.hexdigest() != expected_sha256.lower():
+            raise OSError("embedding model SHA-256 verification failed")
+        _os.chmod(partial, 0o644)
+        _os.replace(partial, target)
+        return target
+    finally:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _resolve_embedding_model_path() -> _Path | None:
+    global _LOCAL_MODEL_PATH, _LOCAL_EMBEDDER_DISABLED
+    if _LOCAL_MODEL_PATH is not None and _LOCAL_MODEL_PATH.is_file():
+        return _LOCAL_MODEL_PATH
+    if EMBEDDING_MODEL_PATH.strip():
+        configured = _Path(EMBEDDING_MODEL_PATH).expanduser().resolve()
+        if configured.is_file():
+            _LOCAL_MODEL_PATH = configured
+            return configured
+        _report_local_embedding_error(f"configured model does not exist: {configured}")
+        _LOCAL_EMBEDDER_DISABLED = True
         return None
-    return None
+    if _Path(EMBEDDING_MODEL_FILE).name != EMBEDDING_MODEL_FILE:
+        _report_local_embedding_error("embedding model filename must not contain a path")
+        _LOCAL_EMBEDDER_DISABLED = True
+        return None
+
+    target = _Path(EMBEDDING_MODEL_CACHE).expanduser().resolve() / EMBEDDING_MODEL_FILE
+    expected_default_size = (
+        DEFAULT_EMBEDDING_MODEL_SIZE
+        if (
+            EMBEDDING_MODEL_REPO == DEFAULT_EMBEDDING_MODEL_REPO
+            and EMBEDDING_MODEL_FILE == DEFAULT_EMBEDDING_MODEL_FILE
+        )
+        else 0
+    )
+    if (
+        target.is_file()
+        and target.stat().st_size > 0
+        and (not expected_default_size or target.stat().st_size == expected_default_size)
+    ):
+        _LOCAL_MODEL_PATH = target
+        return target
+
+    # Reuse an existing cache entry for the exact default artifact without
+    # depending on the application that originally downloaded it.
+    if (
+        EMBEDDING_MODEL_REPO == DEFAULT_EMBEDDING_MODEL_REPO
+        and EMBEDDING_MODEL_FILE == DEFAULT_EMBEDDING_MODEL_FILE
+    ):
+        shared = (
+            _Path.home()
+            / ".cache"
+            / "qmd"
+            / "models"
+            / "hf_ggml-org_embeddinggemma-300M-Q8_0.gguf"
+        )
+        if shared.is_file() and shared.stat().st_size == DEFAULT_EMBEDDING_MODEL_SIZE:
+            _LOCAL_MODEL_PATH = shared.resolve()
+            return _LOCAL_MODEL_PATH
+
+    if EMBEDDING_OFFLINE or not EMBEDDING_AUTO_DOWNLOAD:
+        reason = "offline mode is enabled" if EMBEDDING_OFFLINE else "automatic download is disabled"
+        _report_local_embedding_error(
+            f"model not found and {reason}; set AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL_PATH"
+        )
+        _LOCAL_EMBEDDER_DISABLED = True
+        return None
+    try:
+        _LOCAL_MODEL_PATH = _download_model_file(
+            EMBEDDING_MODEL_URL,
+            target,
+            EMBEDDING_MODEL_SHA256,
+        )
+        return _LOCAL_MODEL_PATH
+    except Exception as exc:  # noqa: BLE001
+        _report_local_embedding_error(f"model download failed ({exc!r})")
+        _LOCAL_EMBEDDER_DISABLED = True
+        return None
+
+
+def _load_local_embedder():
+    global _LOCAL_EMBEDDER, _LOCAL_EMBEDDER_DISABLED
+    if _LOCAL_EMBEDDER_DISABLED:
+        return None
+    if _LOCAL_EMBEDDER is not None:
+        return _LOCAL_EMBEDDER
+    try:
+        from llama_cpp import Llama  # type: ignore
+    except Exception as exc:
+        _report_local_embedding_error(
+            f"llama-cpp-python is not installed ({exc!r})"
+        )
+        _LOCAL_EMBEDDER_DISABLED = True
+        return None
+    model_path = _resolve_embedding_model_path()
+    if model_path is None:
+        return None
+    try:
+        parameters = _inspect.signature(Llama.__init__).parameters
+        embedding_flag = "embeddings" if "embeddings" in parameters else "embedding"
+        kwargs = {
+            "model_path": str(model_path),
+            embedding_flag: True,
+            "n_ctx": 2048,
+            "n_batch": 512,
+            "n_gpu_layers": EMBEDDING_GPU_LAYERS,
+            "verbose": False,
+        }
+        _LOCAL_EMBEDDER = Llama(**kwargs)
+        return _LOCAL_EMBEDDER
+    except Exception as exc:  # noqa: BLE001
+        _report_local_embedding_error(f"failed to load EmbeddingGemma ({exc!r})")
+        _LOCAL_EMBEDDER_DISABLED = True
+        return None
+
+
+def _normalize_embedding(value: object) -> list[float] | None:
+    if hasattr(value, "tolist"):
+        value = value.tolist()  # type: ignore[union-attr]
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    try:
+        vector = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    norm = math.sqrt(sum(item * item for item in vector))
+    if norm <= 0:
+        return None
+    return [item / norm for item in vector]
+
+
+def _extract_embedding_vectors(payload: object, expected_count: int) -> list[list[float]] | None:
+    raw_vectors: object = payload
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return None
+        ordered = sorted(
+            (item for item in data if isinstance(item, dict)),
+            key=lambda item: int(item.get("index", 0)),
+        )
+        raw_vectors = [item.get("embedding") for item in ordered]
+    if hasattr(raw_vectors, "tolist"):
+        raw_vectors = raw_vectors.tolist()  # type: ignore[union-attr]
+    if not isinstance(raw_vectors, (list, tuple)):
+        return None
+    if expected_count == 1 and raw_vectors and isinstance(raw_vectors[0], (int, float)):
+        raw_vectors = [raw_vectors]
+    if len(raw_vectors) != expected_count:
+        return None
+    vectors = [_normalize_embedding(value) for value in raw_vectors]
+    if any(vector is None for vector in vectors):
+        return None
+    dimensions = {len(vector) for vector in vectors if vector is not None}
+    if len(dimensions) != 1:
+        return None
+    return [vector for vector in vectors if vector is not None]
+
+
+def _local_embed_many(texts: list[str]) -> list[list[float]] | None:
+    global _LOCAL_EMBEDDER_DISABLED
+    if not texts:
+        return []
+    model = _load_local_embedder()
+    if model is None:
+        return None
+    try:
+        if hasattr(model, "embed"):
+            payload = model.embed(texts, normalize=True, truncate=True)
+        else:
+            payload = model.create_embedding(texts)
+        vectors = _extract_embedding_vectors(payload, len(texts))
+        if vectors is None:
+            raise ValueError("embedding backend returned an invalid vector shape")
+        return vectors
+    except Exception as exc:  # noqa: BLE001
+        _report_local_embedding_error(f"embedding inference failed ({exc!r})")
+        _LOCAL_EMBEDDER_DISABLED = True
+        return None
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -764,18 +1070,30 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-def _embed_for_chunk(
+def _embedding_model_identity() -> str:
+    path = _LOCAL_MODEL_PATH
+    descriptor = f"hf:{EMBEDDING_MODEL_REPO}/{EMBEDDING_MODEL_FILE}"
+    if path is not None:
+        try:
+            stat = path.stat()
+            descriptor += f"|{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+        except OSError:
+            descriptor += f"|{path}"
+    return hashlib.sha256(descriptor.encode("utf-8")).hexdigest()[:24]
+
+
+def _cached_embedding_for_chunk(
     chunk: "Chunk",
     roots: list[_Path],
+    model_identity: str,
 ) -> list[float] | None:
-    """Embed a chunk, caching per file fingerprint + (start, end)."""
     p = _Path(chunk.file)
     root = _index_root_for(p, roots)
     if root is None:
-        return _ollama_embed(chunk.text[:8000])
+        return None
     fp = _file_fingerprint(p)
     if fp is None:
-        return _ollama_embed(chunk.text[:8000])
+        return None
     idx = _load_index(root)
     files = idx.setdefault("files", {})
     rel = str(p.resolve().relative_to(root))
@@ -785,14 +1103,69 @@ def _embed_for_chunk(
         entry = {"key": key, "spans": {}, "embeds": {}}
         files[rel] = entry
     embeds = entry.setdefault("embeds", {})
-    span_key = f"{chunk.start}-{chunk.end}"
-    if span_key in embeds:
-        return embeds[span_key]
-    vec = _ollama_embed(chunk.text[:8000])
-    if vec is not None:
-        embeds[span_key] = vec
-        _save_index(root, idx)
-    return vec
+    value = embeds.get(f"{model_identity}:{chunk.start}-{chunk.end}")
+    return _normalize_embedding(value) if value is not None else None
+
+
+def _store_embedding_for_chunk(
+    chunk: "Chunk",
+    roots: list[_Path],
+    model_identity: str,
+    vector: list[float],
+) -> None:
+    p = _Path(chunk.file)
+    root = _index_root_for(p, roots)
+    if root is None:
+        return
+    fp = _file_fingerprint(p)
+    if fp is None:
+        return
+    idx = _load_index(root)
+    files = idx.setdefault("files", {})
+    rel = str(p.resolve().relative_to(root))
+    key = [fp[0], fp[1], fp[2]]
+    entry = files.get(rel)
+    if not entry or entry.get("key") != key:
+        entry = {"key": key, "spans": {}, "embeds": {}}
+        files[rel] = entry
+    embeds = entry.setdefault("embeds", {})
+    embeds[f"{model_identity}:{chunk.start}-{chunk.end}"] = vector
+    _save_index(root, idx)
+
+
+def _embeddings_for_chunks(
+    chunks: list["Chunk"],
+    roots: list[_Path],
+    *,
+    use_cache: bool,
+) -> list[list[float] | None]:
+    if not chunks:
+        return []
+    model_identity = _embedding_model_identity()
+    output: list[list[float] | None] = [None] * len(chunks)
+    missing: list[tuple[int, "Chunk"]] = []
+    for index, chunk in enumerate(chunks):
+        cached = (
+            _cached_embedding_for_chunk(chunk, roots, model_identity)
+            if use_cache
+            else None
+        )
+        if cached is not None:
+            output[index] = cached
+        else:
+            missing.append((index, chunk))
+    if not missing:
+        return output
+    vectors = _local_embed_many(
+        [format_document_for_embedding(chunk) for _, chunk in missing]
+    )
+    if vectors is None:
+        return output
+    for (index, chunk), vector in zip(missing, vectors):
+        output[index] = vector
+        if use_cache:
+            _store_embedding_for_chunk(chunk, roots, model_identity, vector)
+    return output
 
 
 
@@ -800,10 +1173,7 @@ def _embed_for_chunk(
 
 CROSS_ENCODER_MODEL = _os.environ.get(
     "AGENTIC_SEMANTIC_SEARCH_CROSS_ENCODER",
-    _os.environ.get(
-        "CODEBASE_SEARCH_CROSS_ENCODER",
-        "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    ),
+    "cross-encoder/ms-marco-MiniLM-L-6-v2",
 )
 _CROSS_ENCODER_CACHE: dict[str, object] = {}
 _CROSS_ENCODER_DISABLED = False
@@ -822,7 +1192,7 @@ def _load_cross_encoder():
     except Exception as exc:
         sys.stderr.write(
             f"cross-encoder: sentence-transformers unavailable ({exc!r}); "
-            "falling back to Ollama cosine rerank\n"
+            "continuing without cross-encoder reranking\n"
         )
         _CROSS_ENCODER_DISABLED = True
         return None
@@ -831,7 +1201,7 @@ def _load_cross_encoder():
     except Exception as exc:
         sys.stderr.write(
             f"cross-encoder: failed to load {CROSS_ENCODER_MODEL!r} ({exc!r}); "
-            "falling back to Ollama cosine rerank\n"
+            "continuing without cross-encoder reranking\n"
         )
         _CROSS_ENCODER_DISABLED = True
         return None

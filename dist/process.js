@@ -92,6 +92,16 @@ export async function runSearchProcess(input, options) {
     const env = { ...process.env, ...options.env };
     if (options.cacheDirectory)
         env.AGENTIC_SEMANTIC_SEARCH_CACHE_DIR = options.cacheDirectory;
+    if (options.embeddingModelPath)
+        env.AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL_PATH = path.resolve(options.cwd, options.embeddingModelPath);
+    if (options.modelCacheDirectory)
+        env.AGENTIC_SEMANTIC_SEARCH_MODEL_CACHE = path.resolve(options.cwd, options.modelCacheDirectory);
+    if (options.offline !== undefined)
+        env.AGENTIC_SEMANTIC_SEARCH_OFFLINE = options.offline ? "1" : "0";
+    if (options.autoDownload !== undefined)
+        env.AGENTIC_SEMANTIC_SEARCH_AUTO_DOWNLOAD = options.autoDownload ? "1" : "0";
+    if (options.gpuLayers !== undefined)
+        env.AGENTIC_SEMANTIC_SEARCH_GPU_LAYERS = String(options.gpuLayers);
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxStdoutBytes = options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
     const maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;

@@ -22,6 +22,11 @@ Options:
       --python PATH             Python interpreter
       --script PATH             Alternate engine script
       --cache-directory PATH    Relative cache directory within each root
+      --embedding-model PATH    Local EmbeddingGemma GGUF file
+      --model-cache PATH        Directory for downloaded model files
+      --offline                 Never download a missing model
+      --no-model-download       Disable automatic model download
+      --gpu-layers N            Layers to offload (-1 for all; default: 0)
       --timeout-ms N            Wall-clock timeout (default: 60000)
   -h, --help                   Show this help
   -v, --version                Show the version
@@ -52,6 +57,11 @@ async function main(): Promise<number> {
   let pythonBin: string | undefined;
   let scriptPath: string | undefined;
   let cacheDirectory: string | undefined;
+  let embeddingModelPath: string | undefined;
+  let modelCacheDirectory: string | undefined;
+  let offline: boolean | undefined;
+  let autoDownload: boolean | undefined;
+  let gpuLayers: number | undefined;
   let timeoutMs: number | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
@@ -68,6 +78,11 @@ async function main(): Promise<number> {
     else if (flag === "--python") pythonBin = takeValue(args, index++, flag);
     else if (flag === "--script") scriptPath = takeValue(args, index++, flag);
     else if (flag === "--cache-directory") cacheDirectory = takeValue(args, index++, flag);
+    else if (flag === "--embedding-model") embeddingModelPath = takeValue(args, index++, flag);
+    else if (flag === "--model-cache") modelCacheDirectory = takeValue(args, index++, flag);
+    else if (flag === "--offline") offline = true;
+    else if (flag === "--no-model-download") autoDownload = false;
+    else if (flag === "--gpu-layers") gpuLayers = Number(takeValue(args, index++, flag));
     else if (flag === "--timeout-ms") timeoutMs = Number(takeValue(args, index++, flag));
     else throw new SemanticSearchError("INVALID_INPUT", `Unknown argument: ${flag}`);
   }
@@ -78,12 +93,25 @@ async function main(): Promise<number> {
   if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs < 1)) {
     throw new SemanticSearchError("INVALID_INPUT", "--timeout-ms must be a positive number");
   }
+  if (gpuLayers !== undefined && (!Number.isInteger(gpuLayers) || gpuLayers < -1)) {
+    throw new SemanticSearchError("INVALID_INPUT", "--gpu-layers must be an integer of -1 or greater");
+  }
 
   const controller = new AbortController();
   const onInterrupt = () => controller.abort();
   process.once("SIGINT", onInterrupt);
   try {
-    const runtime = createSemanticSearchRuntime({ pythonBin, scriptPath, cacheDirectory, timeoutMs });
+    const runtime = createSemanticSearchRuntime({
+      pythonBin,
+      scriptPath,
+      cacheDirectory,
+      embeddingModelPath,
+      modelCacheDirectory,
+      offline,
+      autoDownload,
+      gpuLayers,
+      timeoutMs,
+    });
     const response = await runtime.search(input, { signal: controller.signal });
     if (response.stderr) process.stderr.write(response.stderr);
     process.stdout.write(`${JSON.stringify(response.hits, null, pretty ? 2 : undefined)}\n`);

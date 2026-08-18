@@ -21,3 +21,13 @@ test("CLI searches the bundled engine and preserves no-result exit code", async 
   assert.equal(missing.status, 2, missing.stderr);
   assert.deepEqual(JSON.parse(missing.stdout), []);
 });
+
+test("CLI documents local model and offline controls", () => {
+  const help = spawnSync(process.execPath, ["dist/cli.js", "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /--embedding-model PATH/);
+  assert.match(help.stdout, /--model-cache PATH/);
+  assert.match(help.stdout, /--offline/);
+  assert.match(help.stdout, /--no-model-download/);
+  assert.match(help.stdout, /--gpu-layers N/);
+});

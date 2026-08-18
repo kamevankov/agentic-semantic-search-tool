@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -69,7 +69,7 @@ test("hybrid engine finds an exact symbol and awaits read-hit registration", asy
   ]);
 });
 
-test("tool wrapper returns the OpenClaw-compatible structured result shape", async () => {
+test("tool wrapper returns the generic structured result shape", async () => {
   const { root } = await fixture();
   const tool = createSemanticSearchTool({ cwd: root });
   const result = await tool.execute("call-1", {
@@ -95,7 +95,7 @@ test("no results is a successful invocation with exit code 2", async () => {
 test("persistent cache defaults to a standalone directory", async () => {
   const { root } = await fixture();
   await createSemanticSearchRuntime({ cwd: root }).search({ query: "registerModeSystemTools" });
-  const info = await stat(path.join(root, ".agentic-semantic-search", "index-v1.json"));
+  const info = await stat(path.join(root, ".agentic-semantic-search", "index-v2.json"));
   assert.equal(info.isFile(), true);
 });
 
@@ -132,4 +132,57 @@ test("runtime rejects cache directories that escape search roots", async () => {
     runtime.search({ query: "needle" }),
     (error) => error instanceof SemanticSearchError && error.code === "INVALID_INPUT",
   );
+});
+
+test("runtime forwards local embedding controls to the Python process", async () => {
+  const { root } = await fixture();
+  const scriptPath = path.resolve("test/fixtures/env_engine.py");
+  const runtime = createSemanticSearchRuntime({
+    cwd: root,
+    scriptPath,
+    embeddingModelPath: "models/local.gguf",
+    modelCacheDirectory: "model-cache",
+    offline: true,
+    autoDownload: false,
+    gpuLayers: -1,
+  });
+  const response = await runtime.search({ query: "needle", mode: "semantic" });
+  const received = JSON.parse(response.stderr.trim());
+  assert.equal(received.AGENTIC_SEMANTIC_SEARCH_EMBED_MODEL_PATH, path.join(root, "models/local.gguf"));
+  assert.equal(received.AGENTIC_SEMANTIC_SEARCH_MODEL_CACHE, path.join(root, "model-cache"));
+  assert.equal(received.AGENTIC_SEMANTIC_SEARCH_OFFLINE, "1");
+  assert.equal(received.AGENTIC_SEMANTIC_SEARCH_AUTO_DOWNLOAD, "0");
+  assert.equal(received.AGENTIC_SEMANTIC_SEARCH_GPU_LAYERS, "-1");
+});
+
+test("runtime rejects invalid GPU layer configuration", () => {
+  assert.throws(
+    () => createSemanticSearchRuntime({ gpuLayers: -2 }),
+    (error) => error instanceof SemanticSearchError && error.code === "INVALID_INPUT",
+  );
+});
+
+test("public package sources contain no source-project or retired-backend references", async () => {
+  const ignored = new Set([".git", "node_modules", "__pycache__"]);
+  const extensions = new Set([".md", ".json", ".ts", ".js", ".mjs", ".py", ".txt"]);
+  const forbidden = [
+    ["ol", "lama"].join(""),
+    ["open", "claw"].join(""),
+    ["my", "claw"].join(""),
+  ];
+  const forbiddenPattern = new RegExp(forbidden.join("|"), "i");
+  const violations = [];
+  async function scan(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      if (ignored.has(entry.name) || entry.name.endsWith(".tgz")) continue;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) await scan(absolute);
+      else if (extensions.has(path.extname(entry.name))) {
+        const contents = await readFile(absolute, "utf8");
+        if (forbiddenPattern.test(contents)) violations.push(path.relative(process.cwd(), absolute));
+      }
+    }
+  }
+  await scan(process.cwd());
+  assert.deepEqual(violations, []);
 });

@@ -16,6 +16,7 @@
     "dist/",
     "python/_treesitter_chunks.py",
     "python/agentic_semantic_search.py",
+    "python/requirements-cross-encoder.txt",
     "python/requirements-semantic.txt",
     "python/requirements-treesitter.txt",
     "README.md",

@@ -100,6 +100,11 @@ export interface SemanticSearchRuntimeOptions {
     timeoutMs?: number;
     env?: NodeJS.ProcessEnv;
     cacheDirectory?: string;
+    embeddingModelPath?: string;
+    modelCacheDirectory?: string;
+    offline?: boolean;
+    autoDownload?: boolean;
+    gpuLayers?: number;
     maxStdoutBytes?: number;
     maxStderrBytes?: number;
     strictHitCallbackErrors?: boolean;
